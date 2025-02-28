@@ -1,1 +1,0 @@
-/usr/bin/cc -g -O0   CMakeFiles/container.dir/adlist.c.o CMakeFiles/container.dir/container.c.o CMakeFiles/container.dir/core.c.o CMakeFiles/container.dir/log.c.o CMakeFiles/container.dir/sshserver.c.o CMakeFiles/container.dir/zmalloc.c.o  -o container  -lssh 
