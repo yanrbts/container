@@ -1,295 +1,77 @@
-/* This is a sample implementation of a libssh based SSH server */
 /*
-Copyright 2014 Audrius Butkevicius
-
-This file is part of the SSH Library
-
-You are free to copy this file, modify it in any way, consider it being public
-domain. This does not apply to the rest of the library though, but it is
-allowed to cut-and-paste working code from this file to any license of
-program.
-The goal is to show the API in action.
-./ssh_server_fork 0.0.0.0 -p 2222 -v -k ./ssh_host_rsa_key -P 123 -u user
-ssh-keygen -t rsa -b 4096 -f ssh_host_rsa_key -N ""
-*/
-
-#include "config.h"
-
+ * Copyright (c) 2025-2025, yanruibinghxu@gmail.com All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
 #include <libssh/callbacks.h>
 #include <libssh/server.h>
 
 #include <poll.h>
-#ifdef HAVE_ARGP_H
-#include <argp.h>
-#endif
 #include <fcntl.h>
-#ifdef HAVE_LIBUTIL_H
-#include <libutil.h>
-#endif
+// #include <libutil.h>
 #include <pthread.h>
-#ifdef HAVE_PTY_H
 #include <pty.h>
-#endif
 #include <signal.h>
 #include <stdlib.h>
-#ifdef HAVE_UTMP_H
 #include <utmp.h>
-#endif
-#ifdef HAVE_UTIL_H
-#include <util.h>
-#endif
+// #include <util.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <errno.h>
+#include <ctype.h>
 
 #ifndef BUF_SIZE
 #define BUF_SIZE 1048576
 #endif
 
-#define SESSION_END (SSH_CLOSED | SSH_CLOSED_ERROR)
-#define SFTP_SERVER_PATH "/usr/lib/sftp-server"
-#define AUTH_KEYS_MAX_LINE_SIZE 2048
+#define SESSION_END                 (SSH_CLOSED | SSH_CLOSED_ERROR)
+#define SFTP_SERVER_PATH            "/usr/lib/sftp-server"
+#define AUTH_KEYS_MAX_LINE_SIZE     2048
 
 #define DEF_STR_SIZE 1024
 char authorizedkeys[DEF_STR_SIZE] = {0};
 char username[128] = "myuser";
 char password[128] = "mypassword";
-#ifdef HAVE_ARGP_H
-const char *argp_program_version = "libssh server example "
-SSH_STRINGIFY(LIBSSH_VERSION);
-const char *argp_program_bug_address = "<libssh@libssh.org>";
-
-/* Program documentation. */
-static char doc[] = "libssh -- a Secure Shell protocol implementation";
-
-/* A description of the arguments we accept. */
-static char args_doc[] = "BINDADDR";
-
-/* The options we understand. */
-static struct argp_option options[] = {
-    {
-        .name  = "port",
-        .key   = 'p',
-        .arg   = "PORT",
-        .flags = 0,
-        .doc   = "Set the port to bind.",
-        .group = 0
-    },
-    {
-        .name  = "hostkey",
-        .key   = 'k',
-        .arg   = "FILE",
-        .flags = 0,
-        .doc   = "Set a host key.  Can be used multiple times.  "
-                 "Implies no default keys.",
-        .group = 0
-    },
-    {
-        .name  = "rsakey",
-        .key   = 'r',
-        .arg   = "FILE",
-        .flags = 0,
-        .doc   = "Set the rsa key (deprecated alias for 'k').",
-        .group = 0
-    },
-    {
-        .name  = "ecdsakey",
-        .key   = 'e',
-        .arg   = "FILE",
-        .flags = 0,
-        .doc   = "Set the ecdsa key (deprecated alias for 'k').",
-        .group = 0
-    },
-    {
-        .name  = "authorizedkeys",
-        .key   = 'a',
-        .arg   = "FILE",
-        .flags = 0,
-        .doc   = "Set the authorized keys file.",
-        .group = 0
-    },
-    {
-        .name  = "user",
-        .key   = 'u',
-        .arg   = "USERNAME",
-        .flags = 0,
-        .doc   = "Set expected username.",
-        .group = 0
-    },
-    {
-        .name  = "pass",
-        .key   = 'P',
-        .arg   = "PASSWORD",
-        .flags = 0,
-        .doc   = "Set expected password.",
-        .group = 0
-    },
-    {
-        .name  = "verbose",
-        .key   = 'v',
-        .arg   = NULL,
-        .flags = 0,
-        .doc   = "Get verbose output.",
-        .group = 0
-    },
-    {NULL, 0, NULL, 0, NULL, 0}
-};
-
-/* Parse a single option. */
-static error_t
-parse_opt(int key, char *arg, struct argp_state *state)
-{
-    /* Get the input argument from argp_parse, which we
-     * know is a pointer to our arguments structure. */
-    ssh_bind sshbind = state->input;
-
-    switch (key) {
-    case 'p':
-        ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDPORT_STR, arg);
-        break;
-    case 'k':
-        ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, arg);
-        break;
-    case 'r':
-        ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, arg);
-        break;
-    case 'e':
-        ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, arg);
-        break;
-    case 'a':
-        strncpy(authorizedkeys, arg, DEF_STR_SIZE - 1);
-        break;
-    case 'u':
-        strncpy(username, arg, sizeof(username) - 1);
-        break;
-    case 'P':
-        strncpy(password, arg, sizeof(password) - 1);
-        break;
-    case 'v':
-        ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_LOG_VERBOSITY_STR, "3");
-        break;
-    case ARGP_KEY_ARG:
-        if (state->arg_num >= 1) {
-            /* Too many arguments. */
-            argp_usage(state);
-        }
-        ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDADDR, arg);
-        break;
-    case ARGP_KEY_END:
-        if (state->arg_num < 1) {
-            /* Not enough arguments. */
-            argp_usage(state);
-        }
-        break;
-    default:
-        return ARGP_ERR_UNKNOWN;
-    }
-    return 0;
-}
-
-/* Our argp parser. */
-static struct argp argp = {options, parse_opt, args_doc, doc, NULL, NULL, NULL};
-#else
-static int
-parse_opt(int argc, char **argv, ssh_bind sshbind)
-{
-    int no_default_keys = 0;
-    int rsa_already_set = 0;
-    int ecdsa_already_set = 0;
-    int key;
-
-    while((key = getopt(argc, argv, "a:e:k:p:P:r:u:v")) != -1) {
-        if (key == 'p') {
-            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDPORT_STR, optarg);
-        } else if (key == 'k') {
-            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, optarg);
-            /* We can't track the types of keys being added with this
-            option, so let's ensure we keep the keys we're adding
-            by just not setting the default keys */
-            no_default_keys = 1;
-        } else if (key == 'r') {
-            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, optarg);
-            rsa_already_set = 1;
-        } else if (key == 'e') {
-            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, optarg);
-            ecdsa_already_set = 1;
-        } else if (key == 'a') {
-            strncpy(authorizedkeys, optarg, DEF_STR_SIZE-1);
-        } else if (key == 'u') {
-            strncpy(username, optarg, sizeof(username) - 1);
-        } else if (key == 'P') {
-            strncpy(password, optarg, sizeof(password) - 1);
-        } else if (key == 'v') {
-            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_LOG_VERBOSITY_STR,
-                                 "3");
-        } else {
-            break;
-        }
-    }
-
-    if (key != -1) {
-        printf("Usage: %s [OPTION...] BINDADDR\n"
-               "libssh %s -- a Secure Shell protocol implementation\n"
-               "\n"
-               "  -a, --authorizedkeys=FILE  Set the authorized keys file.\n"
-               "  -e, --ecdsakey=FILE        Set the ecdsa key (deprecated alias for 'k').\n"
-               "  -k, --hostkey=FILE         Set a host key.  Can be used multiple times.\n"
-               "                             Implies no default keys.\n"
-               "  -p, --port=PORT            Set the port to bind.\n"
-               "  -P, --pass=PASSWORD        Set expected password.\n"
-               "  -r, --rsakey=FILE          Set the rsa key (deprecated alias for 'k').\n"
-               "  -u, --user=USERNAME        Set expected username.\n"
-               "  -v, --verbose              Get verbose output.\n"
-               "  -?, --help                 Give this help list\n"
-               "\n"
-               "Mandatory or optional arguments to long options are also mandatory or optional\n"
-               "for any corresponding short options.\n"
-               "\n"
-               "Report bugs to <libssh@libssh.org>.\n",
-               argv[0], SSH_STRINGIFY(LIBSSH_VERSION));
-        return -1;
-    }
-
-    if (optind != argc - 1) {
-        printf("Usage: %s [OPTION...] BINDADDR\n", argv[0]);
-        return -1;
-    }
-
-    ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDADDR, argv[optind]);
-
-    if (!no_default_keys) {
-        set_default_keys(sshbind,
-                         rsa_already_set,
-                         ecdsa_already_set);
-    }
-
-    return 0;
-}
-#endif /* HAVE_ARGP_H */
 
 /* A userdata struct for channel. */
 struct channel_data_struct {
-    /* pid of the child process the channel will spawn. */
-    pid_t pid;
-    /* For PTY allocation */
-    socket_t pty_master;
+    pid_t pid;                  /* pid of the child process the channel will spawn. */
+    socket_t pty_master;        /* For PTY allocation */
     socket_t pty_slave;
-    /* For communication with the child process. */
-    socket_t child_stdin;
+    socket_t child_stdin;       /* For communication with the child process. */
     socket_t child_stdout;
-    /* Only used for subsystem and exec requests. */
-    socket_t child_stderr;
-    /* Event which is used to poll the above descriptors. */
-    ssh_event event;
-    /* Terminal size struct. */
-    struct winsize *winsize;
+    socket_t child_stderr;      /* Only used for subsystem and exec requests. */
+    ssh_event event;            /* Event which is used to poll the above descriptors. */
+    struct winsize *winsize;    /* Terminal size struct. */
 };
 
 /* A userdata struct for session. */
 struct session_data_struct {
-    /* Pointer to the channel the session will allocate. */
-    ssh_channel channel;
+    ssh_channel channel;        /* Pointer to the channel the session will allocate. */
     int auth_attempts;
     int authenticated;
 };
@@ -337,11 +119,19 @@ pty_request(ssh_session session,
     cdata->winsize->ws_xpixel = px;
     cdata->winsize->ws_ypixel = py;
 
-    rc = openpty(&cdata->pty_master,
+    /* The openpty() function finds an available pseudoterminal and 
+     * returns file descriptors for the master and
+     * slave in amaster and aslave.  If name is not NULL, 
+     * the filename of the slave is returned  in  name.   
+     * If termp  is not NULL, the terminal parameters of 
+     * the slave will be set to the values in termp.  If winp is
+     * not NULL, the window size of the slave will be set to the values in winp */
+    rc  = openpty(&cdata->pty_master,
                  &cdata->pty_slave,
                  NULL,
                  NULL,
                  cdata->winsize);
+    
     if (rc != 0) {
         fprintf(stderr, "Failed to open pty\n");
         return SSH_ERROR;
@@ -369,6 +159,9 @@ pty_resize(ssh_session session,
     cdata->winsize->ws_ypixel = py;
 
     if (cdata->pty_master != -1) {
+        /* This line of code is typically used in the context of 
+         * managing a pseudo-terminal (PTY) in Unix-like systems. 
+         * It updates the window size of a pseudo-terminal to match the desired size.*/
         return ioctl(cdata->pty_master, TIOCSWINSZ, cdata->winsize);
     }
 
@@ -389,6 +182,13 @@ exec_pty(const char *mode,
         return SSH_ERROR;
     case 0:
         close(cdata->pty_master);
+
+        /* The  login_tty() function prepares for a login on the terminal fd 
+         * (which may be a real terminal device, or the slave of a pseudoterminal 
+         * as returned by openpty()) by creating a  new session,  
+         * making  fd the controlling terminal for the calling process, 
+         * setting fd to be the standard input, output, and error streams 
+         * of the current process, and closing fd.*/
         if (login_tty(cdata->pty_slave) != 0) {
             exit(1);
         }
@@ -691,9 +491,15 @@ process_stderr(socket_t fd, int revents, void *userdata)
     return n;
 }
 
+/* SIGCHLD handler for cleaning up dead children. */
+static void 
+sigchld_handler(int signo) {
+    (void)signo;
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+}
+
 static void
-handle_session(ssh_event event, ssh_session session)
-{
+handle_session(ssh_event event, ssh_session session) {
     int n;
     int rc = 0;
 
@@ -823,8 +629,8 @@ handle_session(ssh_event event, ssh_session session)
     if (kill(cdata.pid, 0) < 0 && WIFEXITED(rc)) {
         rc = WEXITSTATUS(rc);
         ssh_channel_request_send_exit_status(sdata.channel, rc);
-    /* If client terminated the channel or the process did not exit nicely,
-     * but only if something has been forked. */
+        /* If client terminated the channel or the process did not exit nicely,
+         * but only if something has been forked. */
     } else if (cdata.pid > 0) {
         kill(cdata.pid, SIGKILL);
     }
@@ -838,41 +644,11 @@ handle_session(ssh_event event, ssh_session session)
     }
 }
 
-#ifdef WITH_FORK
-/* SIGCHLD handler for cleaning up dead children. */
-static void sigchld_handler(int signo)
-{
-    (void)signo;
-    while (waitpid(-1, NULL, WNOHANG) > 0);
-}
-#else
-static void *session_thread(void *arg)
-{
-    ssh_session session = arg;
-    ssh_event event;
-
-    event = ssh_event_new();
-    if (event != NULL) {
-        /* Blocks until the SSH session ends by either
-         * child thread exiting, or client disconnecting. */
-        handle_session(event, session);
-        ssh_event_free(event);
-    } else {
-        fprintf(stderr, "Could not create polling context\n");
-    }
-    ssh_disconnect(session);
-    ssh_free(session);
-    return NULL;
-}
-#endif
-
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     ssh_bind sshbind = NULL;
     ssh_session session = NULL;
-    int rc;
-#ifdef WITH_FORK
     struct sigaction sa;
+    int rc;
 
     /* Set up SIGCHLD handler. */
     sa.sa_handler = sigchld_handler;
@@ -882,7 +658,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "Failed to register SIGCHLD handler\n");
         return 1;
     }
-#endif
 
     rc = ssh_init();
     if (rc < 0) {
@@ -896,16 +671,6 @@ int main(int argc, char **argv)
         ssh_finalize();
         return 1;
     }
-
-#ifdef HAVE_ARGP_H
-    argp_parse(&argp, argc, argv, 0, 0, sshbind);
-#else
-    if (parse_opt(argc, argv, sshbind) < 0) {
-        ssh_bind_free(sshbind);
-        ssh_finalize();
-        return 1;
-    }
-#endif /* HAVE_ARGP_H */
 
     rc = ssh_bind_listen(sshbind);
     if (rc < 0) {
@@ -924,49 +689,41 @@ int main(int argc, char **argv)
 
         /* Blocks until there is a new incoming connection. */
         rc = ssh_bind_accept(sshbind, session);
-        if (rc != SSH_ERROR) {
-#ifdef WITH_FORK
-            ssh_event event;
-
-            pid_t pid = fork();
-            switch (pid) {
-            case 0:
-                /* Remove the SIGCHLD handler inherited from parent. */
-                sa.sa_handler = SIG_DFL;
-                sigaction(SIGCHLD, &sa, NULL);
-                /* Remove socket binding, which allows us to restart the
-                 * parent process, without terminating existing sessions. */
-                ssh_bind_free(sshbind);
-
-                event = ssh_event_new();
-                if (event != NULL) {
-                    /* Blocks until the SSH session ends by either
-                     * child process exiting, or client disconnecting. */
-                    handle_session(event, session);
-                    ssh_event_free(event);
-                } else {
-                    fprintf(stderr, "Could not create polling context\n");
-                }
-                ssh_disconnect(session);
-                ssh_free(session);
-
-                exit(0);
-            case -1:
-                fprintf(stderr, "Failed to fork\n");
-            }
-#else
-            pthread_t tid;
-
-            rc = pthread_create(&tid, NULL, session_thread, session);
-            if (rc == 0) {
-                pthread_detach(tid);
-                continue;
-            }
-            fprintf(stderr, "Failed to pthread_create\n");
-#endif
-        } else {
+        if (rc == SSH_ERROR) {
             fprintf(stderr, "%s\n", ssh_get_error(sshbind));
+            ssh_disconnect(session);
+            ssh_free(session);
+            continue;
         }
+
+        ssh_event event;
+        pid_t pid = fork();
+        switch (pid) {
+        case 0:
+            /* Remove the SIGCHLD handler inherited from parent. */
+            sa.sa_handler = SIG_DFL;
+            sigaction(SIGCHLD, &sa, NULL);
+
+            /* Remove socket binding, which allows us to restart the
+             * parent process, without terminating existing sessions. */
+            ssh_bind_free(sshbind);
+
+            event = ssh_event_new();
+            if (event != NULL) {
+                /* Blocks until the SSH session ends by either
+                 * child process exiting, or client disconnecting. */
+                handle_session(event, session);
+                ssh_event_free(event);
+            } else {
+                fprintf(stderr, "Could not create polling context\n");
+            }
+            ssh_disconnect(session);
+            ssh_free(session);
+            exit(0);
+        case -1:
+            fprintf(stderr, "Failed to fork\n");
+        }
+
         /* Since the session has been passed to a child fork, do some cleaning
          * up at the parent process. */
         ssh_disconnect(session);

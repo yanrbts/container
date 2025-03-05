@@ -107,6 +107,7 @@ void ct_ssh_init(ct_ssh_server_t *ssh) {
 int ct_ssh_loop(ct_ssh_server_t *ssh) {
     int rc;
     ssh_session session = NULL;
+    ssh_key pubkey, privkey;
     struct sigaction sa;
 
     sa.sa_sigaction = sigchld_handler_with_count;
@@ -128,9 +129,9 @@ int ct_ssh_loop(ct_ssh_server_t *ssh) {
         return CT_ERROR;
     }
 
-    const char *rsa_key_path = "/home/yrb/src/container/key/ssh_host_rsa_key";
-    const char *ecdsa_key_path = "/home/yrb/src/container/key/ssh_host_ecdsa_key";
-    const char *ed25519_key_path = "/home/yrb/src/container/key/ssh_host_ed25519_key";
+    const char *rsa_key_path = "/home/yrb/container/key/ssh_host_rsa_key";
+    const char *ecdsa_key_path = "/home/yrb/container/key/ssh_host_ecdsa_key";
+    const char *ed25519_key_path = "/home/yrb/container/key/ssh_host_ed25519_key";
 
     rc = ssh_bind_options_set(ssh->sshbind, SSH_BIND_OPTIONS_BINDADDR, "0.0.0.0");
     if (rc != SSH_OK) {
@@ -138,6 +139,7 @@ int ct_ssh_loop(ct_ssh_server_t *ssh) {
         ssh_finalize();
         return CT_ERROR;
     }
+
     int port = 2222;
     rc = ssh_bind_options_set(ssh->sshbind, SSH_BIND_OPTIONS_BINDPORT, &port);
     if (rc < 0) {
@@ -186,34 +188,71 @@ int ct_ssh_loop(ct_ssh_server_t *ssh) {
 
         /* Blocks until there is a new incoming connection. */
         rc = ssh_bind_accept(ssh->sshbind, session);
-        if (rc != SSH_ERROR) {
-            log_info("New session started. Active sessions: %d", ++ssh->session_count);
+        if (rc == SSH_ERROR) {
+            log_error("ssh_bind_accept failed: %s", ssh_get_error(session));
+            ssh_disconnect(session);
+            ssh_free(session);
+            continue;
+        }
 
-            ssh_event event;
-            pid_t pid = fork();
-            if (pid == 0) {
-                /* Remove socket binding, which allows us to restart the
-                 * parent process, without terminating existing sessions. */
-                ssh_bind_free(ssh->sshbind);
+        rc = ssh_handle_key_exchange(session);
+        if (rc != SSH_OK) {
+            log_error("Key exchange failed: %s", ssh_get_error(session));
+            ssh_disconnect(session);
+            ssh_free(session);
+            continue;
+        }
 
-                event = ssh_event_new();
-                if (event != NULL) {
-                    /* Blocks until the SSH session ends by either
-                     * child process exiting, or client disconnecting. */
-                    handle_session(event, session);
-                    ssh_event_free(event);
-                } else {
-                    log_error("Could not create polling context");
-                }
-                ssh_disconnect(session);
-                ssh_free(session);
-                exit(0);
-            } else if (pid > 0) {
-                ssh_free(session);
+        rc = ssh_pki_import_pubkey_file("/home/yrb/container/key/ssh_host_rsa_key.pub", &pubkey);
+        if (rc != SSH_OK) {
+            log_error("Error loading public key: %s", ssh_get_error(session));
+            ssh_disconnect(session);
+            ssh_free(session);
+            continue;
+        }
+
+        rc = ssh_pki_import_privkey_file("/home/yrb/container/key/ssh_host_rsa_key", NULL, NULL, NULL, &privkey);
+        if (rc != SSH_OK) {
+            log_error("Error loading private key: %s", ssh_get_error(session));
+            ssh_disconnect(session);
+            ssh_free(session);
+            continue;
+        }
+
+        ssh_set_auth_methods(session, SSH_AUTH_METHOD_PUBLICKEY);
+        rc = ssh_userauth_publickey(session, NULL, pubkey);
+        if (rc == SSH_AUTH_SUCCESS) {
+            log_info("Authentication successful");
+        } else {
+            log_error("Authentication failed: %s", ssh_get_error(session));
+        }
+
+        log_info("New session started. Active sessions: %d", ++ssh->session_count);
+
+        ssh_event event;
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* Remove socket binding, which allows us to restart the
+                * parent process, without terminating existing sessions. */
+            ssh_bind_free(ssh->sshbind);
+
+            event = ssh_event_new();
+            if (event != NULL) {
+                /* Blocks until the SSH session ends by either
+                    * child process exiting, or client disconnecting. */
+                handle_session(event, session);
+                ssh_event_free(event);
             } else {
-                ssh_disconnect(session);
-                ssh_free(session);
+                log_error("Could not create polling context");
             }
+            ssh_disconnect(session);
+            ssh_free(session);
+            exit(0);
+        } else if (pid > 0) {
+            ssh_free(session);
+        } else {
+            ssh_disconnect(session);
+            ssh_free(session);
         }
     }
 

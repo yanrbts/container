@@ -145,6 +145,7 @@ int main() {
     ct_ssh_server_t ssh;
 
     ssh_set_log_level(SSH_LOG_DEBUG);
+    ssh_set_log_level(SSH_LOG_TRACE);
     
     ct_ssh_init(&ssh);
     ct_ssh_loop(&ssh);
