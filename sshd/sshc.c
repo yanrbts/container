@@ -25,6 +25,10 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
+
+/* ssh-keygen -t rsa -b 4096 -f ssh_host_rsa_key -N ""
+ * ./sshc -p 2222 -v -k ./ssh_host_rsa_key -P 123 -u user 0.0.0.0 */
+#define _GNU_SOURCE
 #include <libssh/callbacks.h>
 #include <libssh/server.h>
 
@@ -43,6 +47,14 @@
 #include <stdio.h>
 #include <errno.h>
 #include <ctype.h>
+#include <sched.h>
+#include <sys/mount.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
 
 #ifndef BUF_SIZE
 #define BUF_SIZE 1048576
@@ -51,11 +63,34 @@
 #define SESSION_END                 (SSH_CLOSED | SSH_CLOSED_ERROR)
 #define SFTP_SERVER_PATH            "/usr/lib/sftp-server"
 #define AUTH_KEYS_MAX_LINE_SIZE     2048
+#define KEYS_FOLDER                 "/etc/ssh/"
+#define SESSION_ROOT                "/tmp/session_root"
 
 #define DEF_STR_SIZE 1024
 char authorizedkeys[DEF_STR_SIZE] = {0};
 char username[128] = "myuser";
 char password[128] = "mypassword";
+char ushare_dir[1024] = {0};
+
+static const char helpusage[] = "\n"
+            "Usage: %s [OPTION...] BINDADDR\n"
+            "\n"
+            "  -a, --authorizedkeys=FILE  Set the authorized keys file.\n"
+            "  -e, --ecdsakey=FILE        Set the ecdsa key (deprecated alias for 'k').\n"
+            "  -k, --hostkey=FILE         Set a host key.  Can be used multiple times.\n"
+            "                             Implies no default keys.\n"
+            "  -p, --port=PORT            Set the port to bind.\n"
+            "  -P, --pass=PASSWORD        Set expected password.\n"
+            "  -r, --rsakey=FILE          Set the rsa key (deprecated alias for 'k').\n"
+            "  -u, --user=USERNAME        Set expected username.\n"
+            "  -d, --dir=PATH             Set isolation path.\n"
+            "  -v, --verbose              Get verbose output.\n"
+            "  -?, --help                 Give this help list\n"
+            "\n"
+            "Mandatory or optional arguments to long options are also mandatory or optional\n"
+            "for any corresponding short options.\n"
+            "\n"
+            "Report bugs to <772166784@qq.com>.\n";
 
 /* A userdata struct for channel. */
 struct channel_data_struct {
@@ -75,6 +110,8 @@ struct session_data_struct {
     int auth_attempts;
     int authenticated;
 };
+
+static void setup_namespace();
 
 static int
 data_function(ssh_session session,
@@ -136,6 +173,7 @@ pty_request(ssh_session session,
         fprintf(stderr, "Failed to open pty\n");
         return SSH_ERROR;
     }
+
     return SSH_OK;
 }
 
@@ -178,7 +216,7 @@ exec_pty(const char *mode,
     case -1:
         close(cdata->pty_master);
         close(cdata->pty_slave);
-        fprintf(stderr, "Failed to fork\n");
+        fprintf(stderr, "PTY Failed to fork %s\n", strerror(errno));
         return SSH_ERROR;
     case 0:
         close(cdata->pty_master);
@@ -192,7 +230,7 @@ exec_pty(const char *mode,
         if (login_tty(cdata->pty_slave) != 0) {
             exit(1);
         }
-        execl("/bin/sh", "sh", mode, command, NULL);
+        execl("/bin/bash", "sh", mode, command, NULL);
         exit(0);
     default:
         close(cdata->pty_slave);
@@ -234,7 +272,7 @@ exec_nopty(const char *command, struct channel_data_struct *cdata)
         close(out[1]);
         close(err[1]);
         /* exec the requested command. */
-        execl("/bin/sh", "sh", "-c", command, NULL);
+        execl("/bin/bash", "sh", "-c", command, NULL);
         exit(0);
     }
 
@@ -549,8 +587,10 @@ handle_session(ssh_event event, ssh_session session) {
     if (authorizedkeys[0]) {
         server_cb.auth_pubkey_function = auth_publickey;
         ssh_set_auth_methods(session, SSH_AUTH_METHOD_PASSWORD | SSH_AUTH_METHOD_PUBLICKEY);
-    } else
+    } else {
         ssh_set_auth_methods(session, SSH_AUTH_METHOD_PASSWORD);
+    }
+        
 
     ssh_callbacks_init(&server_cb);
     ssh_callbacks_init(&channel_cb);
@@ -585,7 +625,7 @@ handle_session(ssh_event event, ssh_session session) {
         /* Poll the main event which takes care of the session, the channel and
          * even our child process's stdout/stderr (once it's started). */
         if (ssh_event_dopoll(event, -1) == SSH_ERROR) {
-          ssh_channel_close(sdata.channel);
+            ssh_channel_close(sdata.channel);
         }
 
         /* If child process's stdout/stderr has been registered with the event,
@@ -644,6 +684,377 @@ handle_session(ssh_event event, ssh_session session) {
     }
 }
 
+static void set_default_keys(ssh_bind sshbind,
+                             int rsa_already_set,
+                             int ecdsa_already_set)
+{
+    if (!rsa_already_set){
+        ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY,
+                             KEYS_FOLDER "ssh_host_rsa_key");
+    }
+
+    if (!ecdsa_already_set){
+        ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY,
+                             KEYS_FOLDER "ssh_host_ecdsa_key");
+    }
+
+    ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY,
+                         KEYS_FOLDER "ssh_host_ed25519_key");
+}
+
+/********************************MOUNT**************************************/
+
+static int
+pivot_root(const char *new_root, const char *put_old) {
+    return syscall(SYS_pivot_root, new_root, put_old);
+}
+
+static void setup_namespace() {
+    if (geteuid() != 0) {
+        fprintf(stderr, "This program must be run as root\n");
+        exit(1);
+    }
+
+    // Step 1: Unshare necessary namespaces
+    // CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS
+    if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET) < 0) {
+        perror("unshare failed");
+        exit(1);
+    }
+
+    // Step 2: Create a unique session root directory
+    pid_t pid = getpid(); // Get current process ID for unique naming
+    char session_root[256];
+    snprintf(session_root, sizeof(session_root), "/tmp/session_%d", pid);
+
+    if (mkdir(session_root, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir session_root failed");
+        exit(1);
+    }
+
+    // Step 3: Mount the root directory as tmpfs for isolation
+    if (mount("none", session_root, "tmpfs", 0, "") < 0) {
+        perror("mount session_root failed");
+        exit(1);
+    }
+
+    // Step 4: Create a mount point for the old root
+    char old_root[256];
+    snprintf(old_root, sizeof(old_root), "%s/old_root", session_root);
+
+    if (mkdir(old_root, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir old_root failed");
+        exit(1);
+    }
+
+    // Step 5: Change to the new root directory
+    if (chdir(session_root) < 0) {
+        perror("chdir session_root failed");
+        exit(1);
+    }
+
+    // Step 6: Perform pivot_root
+    fprintf(stderr, "Mounting %s to %s\n", session_root, old_root);
+    if (pivot_root(session_root, old_root) < 0) {
+        perror("pivot_root failed");
+        exit(1);
+    }
+
+    // Step 7: Switch to the new root
+    if (chdir("/") < 0) {
+        perror("chdir to new / failed");
+        exit(1);
+    }
+
+    // Step 8: Unmount the old root
+    if (umount2("/old_root", MNT_DETACH) < 0) {
+        perror("umount old_root failed");
+        exit(1);
+    }
+
+    // Step 9: Remove the old root directory
+    if (rmdir("/old_root") < 0) {
+        perror("rmdir old_root failed");
+        exit(1);
+    }
+
+    // Step 10: Recreate necessary directories in the new namespace
+    if (mkdir("/tmp", 0755) < 0 && errno != EEXIST) {
+        perror("mkdir /tmp failed");
+        exit(1);
+    }
+
+    if (mkdir("/home", 0755) < 0 && errno != EEXIST) {
+        perror("mkdir /home failed");
+        exit(1);
+    }
+
+    // 创建新的 /dev 目录
+    if (mkdir("/dev", 0755) < 0 && errno != EEXIST) {
+        perror("mkdir /dev failed");
+        exit(1);
+    }
+
+    // 绑定 /dev 设备目录（共享宿主机的 /dev）
+    if (mount("none", "/dev", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_RELATIME, NULL) < 0) {
+        perror("mount /dev failed");
+        exit(1);
+    }
+
+    // 创建 /dev/pts 目录
+    if (mkdir("/dev/pts", 0755) < 0 && errno != EEXIST) {
+        perror("mkdir /dev/pts failed");
+        exit(1);
+    }
+
+    // 重新挂载 /dev/pts 以支持 PTY
+    if (mount("devpts", "/dev/pts", "devpts", 0, NULL) < 0) {
+        perror("mount /dev/pts failed");
+        exit(1);
+    }
+
+    // 创建 /dev/ptmx 设备文件（用于 PTY）
+    if (mknod("/dev/ptmx", S_IFCHR | 0666, makedev(5, 2)) < 0 && errno != EEXIST) {
+        perror("mknod /dev/ptmx failed");
+        exit(1);
+    }
+
+    // 创建必要的设备节点
+    system("ln -s /dev/pts/ptmx /dev/ptmx"); // 确保 /dev/ptmx 正确链接
+    system("chmod 666 /dev/ptmx"); // 给予足够权限
+
+    if (mkdir("/proc", 0755) < 0 && errno != EEXIST) {
+        perror("mkdir /proc failed");
+        exit(1);
+    }
+    if (mount("proc", "/proc", "proc", 0, "") < 0) {
+        perror("mount /proc failed");
+        exit(1);
+    }
+
+
+    printf("Namespace setup complete! Isolated environment created.\n");
+}
+
+void setup_namespace2() {
+    if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET) < 0) {
+        perror("unshare failed");
+        exit(1);
+    }
+
+    /* 使 mount namespace 私有，防止影响宿主机 */
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+        perror("mount private failed");
+        exit(1);
+    }
+
+    /* fork 并让子进程成为新的 PID 1 */
+    // pid_t pid = fork();
+    // if (pid < 0) {
+    //     perror("fork failed");
+    //     exit(1);
+    // }
+
+    // if (pid > 0) {
+    //     /* 父进程退出，让子进程成为 PID 1 */
+    //     exit(0);
+    // }
+
+    /* 重新挂载一个新的 `/proc`，防止看到宿主机进程 */
+    if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
+        perror("mount /proc failed");
+        exit(1);
+    }
+
+    // /* 重新挂载一个 tmpfs，隔离 `/tmp` 目录 */
+    if (mount("tmpfs", "/tmp", "tmpfs", 0, NULL) < 0) {
+        perror("mount /tmp failed");
+        exit(1);
+    }
+
+    /* 创建 session_root 目录 */
+    // mkdir(SESSION_ROOT, 0755);
+
+    // /* 让 session_root 变成一个独立的 mount */
+    // if (mount("none", SESSION_ROOT, "tmpfs", 0, "") < 0) {
+    //     perror("mount session_root failed");
+    //     exit(1);
+    // }
+
+    // /* 挂载必需的设备文件到 session_root */
+    // if (mount("none", SESSION_ROOT"/dev", "tmpfs", MS_NODEV | MS_NOEXEC | MS_NOSUID, "") < 0) {
+    //     perror("mount /dev failed");
+    //     exit(1);
+    // }
+
+    // if (mkdir(SESSION_ROOT"/dev/pts", 0755) < 0 && errno != EEXIST) {
+    //     perror("mkdir /dev/pts failed");
+    //     exit(1);
+    // }
+
+    // if (mount("devpts", SESSION_ROOT"/dev/pts", "devpts", 0, NULL) < 0) {
+    //     perror("mount /dev/pts failed");
+    //     exit(1);
+    // }
+
+    // if (mkdir(SESSION_ROOT"/dev/tty", 0755) < 0 && errno != EEXIST) {
+    //     perror("mkdir /dev/tty failed");
+    //     exit(1);
+    // }
+
+    // /* chroot 到 SESSION_ROOT，使其成为新的根目录 */
+    // if (chroot(SESSION_ROOT) < 0) {
+    //     perror("chroot failed");
+    //     exit(1);
+    // }
+
+    if (chroot("/tmp") < 0) {
+        perror("chroot failed");
+        exit(1);
+    }
+
+    /* 切换到新根目录，防止访问宿主机 */
+    if (chdir("/") < 0) {
+        perror("chdir to new root failed");
+        exit(1);
+    }
+
+    printf("Namespace setup complete! Isolated environment created.\n");
+}
+
+static void setup_namespace3() {
+    if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET) < 0) {
+        perror("unshare failed");
+        exit(1);
+    }
+
+    /* 使 mount namespace 私有，防止影响宿主机 */
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+        perror("mount private failed");
+        exit(1);
+    }
+
+    /* 创建 session_root 目录 */
+    char session_root[256];
+    snprintf(session_root, sizeof(session_root), "/tmp/session_%d", getpid());
+
+    if (mkdir(session_root, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir session_root failed");
+        exit(1);
+    }
+
+    /* 挂载 tmpfs 作为写入层 */
+    if (mount("tmpfs", session_root, "tmpfs", 0, "") < 0) {
+        perror("mount session_root failed");
+        exit(1);
+    }
+
+    /* 挂载 overlay 文件系统 */
+    const char *lower_dir = "/var/lib/sshchroot";  // 只读基础层
+    char upper_dir[256];  // Ensure the buffer size is large enough
+    snprintf(upper_dir, sizeof(upper_dir), "%s/upper", session_root);
+    char work_dir[256];
+    snprintf(work_dir, sizeof(work_dir), "%s/work", session_root);
+    char merged_dir[256];
+    snprintf(merged_dir, sizeof(merged_dir), "%s/merged", session_root);
+
+    if (mkdir(upper_dir, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir upper_dir failed");
+        exit(1);
+    }
+
+    if (mkdir(work_dir, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir work_dir failed");
+        exit(1);
+    }
+
+    if (mkdir(merged_dir, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir merged_dir failed");
+        exit(1);
+    }
+
+    char overlay_opts[256];
+    snprintf(overlay_opts, sizeof(overlay_opts), "lowerdir=%s,upperdir=%s,workdir=%s", lower_dir, upper_dir, work_dir);
+
+    if (mount("overlay", merged_dir, "overlay", 0, overlay_opts) < 0) {
+        perror("mount overlay failed");
+        exit(1);
+    }
+
+    /* chroot 到合并后的目录 */
+    if (chroot(merged_dir) < 0) {
+        perror("chroot failed");
+        exit(1);
+    }
+
+    /* 切换到新根目录 */
+    if (chdir("/") < 0) {
+        perror("chdir to new root failed");
+        exit(1);
+    }
+
+    printf("Namespace setup complete! Isolated environment created.\n");
+}
+
+
+/****************************************************************************/
+static int
+parse_opt(int argc, char **argv, ssh_bind sshbind)
+{
+    int no_default_keys = 0;
+    int rsa_already_set = 0;
+    int ecdsa_already_set = 0;
+    int key;
+
+    while((key = getopt(argc, argv, "a:e:k:p:P:r:u:v")) != -1) {
+        if (key == 'p') {
+            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDPORT_STR, optarg);
+        } else if (key == 'k') {
+            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, optarg);
+            /* We can't track the types of keys being added with this
+            option, so let's ensure we keep the keys we're adding
+            by just not setting the default keys */
+            no_default_keys = 1;
+        } else if (key == 'r') {
+            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, optarg);
+            rsa_already_set = 1;
+        } else if (key == 'e') {
+            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, optarg);
+            ecdsa_already_set = 1;
+        } else if (key == 'a') {
+            strncpy(authorizedkeys, optarg, DEF_STR_SIZE-1);
+        } else if (key == 'u') {
+            strncpy(username, optarg, sizeof(username) - 1);
+        } else if (key == 'P') {
+            strncpy(password, optarg, sizeof(password) - 1);
+        } else if (key == 'v') {
+            ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_LOG_VERBOSITY_STR, "3");
+        } else if (key == 'd') {
+            strncpy(ushare_dir, optarg, sizeof(ushare_dir) - 1);
+        } else {
+            break;
+        }
+    }
+
+    if (key != -1) {
+        printf(helpusage, argv[0]);
+        return -1;
+    }
+
+    if (optind != argc - 1) {
+        printf("Usage: %s [OPTION...] BINDADDR\n", argv[0]);
+        return -1;
+    }
+
+    ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDADDR, argv[optind]);
+
+    if (!no_default_keys) {
+        set_default_keys(sshbind, rsa_already_set, ecdsa_already_set);
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv) {
     ssh_bind sshbind = NULL;
     ssh_session session = NULL;
@@ -658,7 +1069,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to register SIGCHLD handler\n");
         return 1;
     }
-
+    
     rc = ssh_init();
     if (rc < 0) {
         fprintf(stderr, "ssh_init failed\n");
@@ -668,6 +1079,12 @@ int main(int argc, char **argv) {
     sshbind = ssh_bind_new();
     if (sshbind == NULL) {
         fprintf(stderr, "ssh_bind_new failed\n");
+        ssh_finalize();
+        return 1;
+    }
+
+    if (parse_opt(argc, argv, sshbind) < 0) {
+        ssh_bind_free(sshbind);
         ssh_finalize();
         return 1;
     }
@@ -707,6 +1124,8 @@ int main(int argc, char **argv) {
             /* Remove socket binding, which allows us to restart the
              * parent process, without terminating existing sessions. */
             ssh_bind_free(sshbind);
+
+            setup_namespace3();
 
             event = ssh_event_new();
             if (event != NULL) {
