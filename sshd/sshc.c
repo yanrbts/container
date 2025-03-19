@@ -112,6 +112,7 @@ struct session_data_struct {
 };
 
 static void setup_namespace();
+static int generate_session_id();
 
 static int
 data_function(ssh_session session,
@@ -144,6 +145,7 @@ pty_request(ssh_session session,
             int px,
             void *userdata)
 {
+    printf("[+] openpty\n");
     struct channel_data_struct *cdata = (struct channel_data_struct *)userdata;
     int rc;
 
@@ -163,14 +165,14 @@ pty_request(ssh_session session,
      * If termp  is not NULL, the terminal parameters of 
      * the slave will be set to the values in termp.  If winp is
      * not NULL, the window size of the slave will be set to the values in winp */
-    rc  = openpty(&cdata->pty_master,
+    rc = openpty(&cdata->pty_master,
                  &cdata->pty_slave,
                  NULL,
                  NULL,
                  cdata->winsize);
     
     if (rc != 0) {
-        fprintf(stderr, "Failed to open pty\n");
+        fprintf(stderr, "Failed to open pty %s\n", strerror(errno));
         return SSH_ERROR;
     }
 
@@ -186,6 +188,7 @@ pty_resize(ssh_session session,
            int px,
            void *userdata)
 {
+    printf("[+] ioctl TIOCSWINSZ\n");
     struct channel_data_struct *cdata = (struct channel_data_struct *)userdata;
 
     (void)session;
@@ -220,7 +223,7 @@ exec_pty(const char *mode,
         return SSH_ERROR;
     case 0:
         close(cdata->pty_master);
-
+        printf("[+] child login_tty\n");
         /* The  login_tty() function prepares for a login on the terminal fd 
          * (which may be a real terminal device, or the slave of a pseudoterminal 
          * as returned by openpty()) by creating a  new session,  
@@ -228,9 +231,13 @@ exec_pty(const char *mode,
          * setting fd to be the standard input, output, and error streams 
          * of the current process, and closing fd.*/
         if (login_tty(cdata->pty_slave) != 0) {
+            printf("[+] login_tty error %s\n", strerror(errno));
             exit(1);
         }
-        execl("/bin/bash", "sh", mode, command, NULL);
+        
+        if (execl("/bin/bash", "sh", mode, command, NULL) == -1) {
+             printf("[+] execl %s\n", strerror(errno));
+        }
         exit(0);
     default:
         close(cdata->pty_slave);
@@ -243,6 +250,7 @@ exec_pty(const char *mode,
 static int
 exec_nopty(const char *command, struct channel_data_struct *cdata)
 {
+    printf("[+] exec_nopty\n");
     int in[2], out[2], err[2];
 
     /* Do the plumbing to be able to talk with the child process. */
@@ -305,6 +313,7 @@ exec_request(ssh_session session,
              const char *command,
              void *userdata)
 {
+    printf("[+] exec_request\n");
     struct channel_data_struct *cdata = (struct channel_data_struct *)userdata;
 
     (void)session;
@@ -315,6 +324,7 @@ exec_request(ssh_session session,
     }
 
     if (cdata->pty_master != -1 && cdata->pty_slave != -1) {
+        printf("[+] exec_request->exec_pty -c\n");
         return exec_pty("-c", command, cdata);
     }
     return exec_nopty(command, cdata);
@@ -323,6 +333,7 @@ exec_request(ssh_session session,
 static int
 shell_request(ssh_session session, ssh_channel channel, void *userdata)
 {
+    printf("[+] shell_request->exec_pty -l\n");
     struct channel_data_struct *cdata = (struct channel_data_struct *)userdata;
 
     (void)session;
@@ -358,12 +369,18 @@ auth_password(ssh_session session,
               const char *pass,
               void *userdata)
 {
+    printf("[+] auth_password\n");
     struct session_data_struct *sdata = (struct session_data_struct *)userdata;
 
     (void)session;
 
     if (strcmp(user, username) == 0 && strcmp(pass, password) == 0) {
         sdata->authenticated = 1;
+        setup_namespace(user);
+        return SSH_AUTH_SUCCESS;
+    } else if (strcmp(user, "yrb2") == 0 && strcmp(pass, "123") == 0) {
+        sdata->authenticated = 1;
+        setup_namespace(user);
         return SSH_AUTH_SUCCESS;
     }
 
@@ -489,6 +506,7 @@ auth_publickey(ssh_session session,
 static ssh_channel
 channel_open(ssh_session session, void *userdata)
 {
+    printf("[+] channel_open\n");
     struct session_data_struct *sdata = (struct session_data_struct *)userdata;
 
     sdata->channel = ssh_channel_new(session);
@@ -515,6 +533,7 @@ process_stdout(socket_t fd, int revents, void *userdata)
 static int
 process_stderr(socket_t fd, int revents, void *userdata)
 {
+    printf("[+] process_stderr\n");
     char buf[BUF_SIZE];
     int n = -1;
     ssh_channel channel = (ssh_channel)userdata;
@@ -704,298 +723,159 @@ static void set_default_keys(ssh_bind sshbind,
 
 /********************************MOUNT**************************************/
 
-static int
-pivot_root(const char *new_root, const char *put_old) {
-    return syscall(SYS_pivot_root, new_root, put_old);
+static int generate_session_id() {
+    srand((unsigned int)time(NULL)); // 使用当前时间初始化随机数种子
+    return rand();                  // 返回随机整数
 }
 
-static void setup_namespace() {
-    if (geteuid() != 0) {
-        fprintf(stderr, "This program must be run as root\n");
-        exit(1);
+#include <sys/prctl.h>
+#include <linux/capability.h>
+#define SSH_VFS_PATH        "/tmp/session/session_%s"
+#define SSH_SEROOT_PATH     "/tmp/session"
+// 配置 OverlayFS
+static void setup_overlay_fs(const char *session_name) {
+    char lowerdir[] = "/";
+    char upperdir[256];
+    char workdir[256];
+    char mnt_point[256];
+    char mount_data[4096];
+    char session_root[256];
+
+    // Create a separate directory for each session
+    snprintf(upperdir, sizeof(upperdir), SSH_VFS_PATH"/upper", session_name);
+    snprintf(workdir, sizeof(workdir), SSH_VFS_PATH"/work", session_name);
+    snprintf(mnt_point, sizeof(mnt_point), SSH_VFS_PATH"/mnt", session_name);
+
+    if (mkdir(SSH_SEROOT_PATH, 0755) < 0 && errno != EEXIST) {
+        perror("Failed to create /tmp/session");
+        exit(EXIT_FAILURE);
     }
 
-    // Step 1: Unshare necessary namespaces
-    // CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS
+    /* Create a session root directory */
+    snprintf(session_root, sizeof(session_root), SSH_VFS_PATH, session_name);
+    if (mkdir(session_root, 0755) < 0 && errno != EEXIST) {
+        perror("Failed to create session root");
+        exit(EXIT_FAILURE);
+    }
+
+    if (mkdir(upperdir, 0755) < 0 && errno != EEXIST) {
+        perror("Failed to create upperdir");
+        exit(EXIT_FAILURE);
+    }
+    if (mkdir(workdir, 0755) < 0 && errno != EEXIST) {
+        perror("Failed to create workdir");
+        exit(EXIT_FAILURE);
+    }
+    if (mkdir(mnt_point, 0755) < 0 && errno != EEXIST) {
+        perror("Failed to create mnt_point");
+        exit(EXIT_FAILURE);
+    }
+
+    snprintf(mount_data, sizeof(mount_data), "lowerdir=%s,upperdir=%s,workdir=%s", lowerdir, upperdir, workdir);
+
+    /* mounts an OverlayFS, merging two directories (lower and upper) 
+     * into a single unified directory structure. This is commonly 
+     * used to create an isolated or temporary writable environment 
+     * while preserving the original (lower layer) filesystem.*/
+    if (mount("overlay", mnt_point, "overlay", 0, mount_data) < 0) {
+        perror("OverlayFS mount failed");
+        exit(EXIT_FAILURE);
+    }
+    printf("Mounted OverlayFS with lowerdir=%s, upperdir=%s, workdir=%s at %s\n", lowerdir, upperdir, workdir, mnt_point);
+}
+
+/* Initialize the namespace and isolate the file system 
+ * session_name : Create a private mount point based on the login username*/
+void setup_namespace(const char *session_name) {
+    char mnt_point[256];
+
+    // prctl(PR_CAPBSET_DROP, CAP_SYS_ADMIN);
+
+    /* Create new namespaces:
+     * - CLONE_NEWUSER: Isolate user and group IDs
+     * - CLONE_NEWPID: Isolate process IDs (PID namespace)
+     * - CLONE_NEWNS: Isolate mount points
+     * - CLONE_NEWIPC: Isolate inter-process communication
+     * - CLONE_NEWUTS: Isolate hostname and domain name
+     * - CLONE_NEWNET: Isolate network interfaces */
     if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET) < 0) {
         perror("unshare failed");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
-    // Step 2: Create a unique session root directory
-    pid_t pid = getpid(); // Get current process ID for unique naming
-    char session_root[256];
-    snprintf(session_root, sizeof(session_root), "/tmp/session_%d", pid);
+    snprintf(mnt_point, sizeof(mnt_point), SSH_VFS_PATH"/mnt", session_name);
 
-    if (mkdir(session_root, 0755) < 0 && errno != EEXIST) {
-        perror("mkdir session_root failed");
-        exit(1);
+    /* configuring the mount namespace to be private. 
+     * Setting the mount namespace to private ensures that any changes 
+     * are local to this namespace, making it isolated and preventing 
+     * unintended modifications to the host or other namespaces.
+     * 
+     * This call doesn't mount a new filesystem; instead, it modifies 
+     * the mount properties for the current namespace.
+     * It applies to the root (/) of the filesystem and all its submounts.*/
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+        perror("Making mount namespace private failed");
+        exit(EXIT_FAILURE);
     }
 
-    // Step 3: Mount the root directory as tmpfs for isolation
-    if (mount("none", session_root, "tmpfs", 0, "") < 0) {
-        perror("mount session_root failed");
-        exit(1);
+    /* Configuring OverlayFS */
+    setup_overlay_fs(session_name);
+
+    /* Switch the root directory to the OverlayFS mount point */
+    if (chdir(mnt_point) < 0) {
+        perror("chdir to new root failed");
+        exit(EXIT_FAILURE);
+    }
+    if (chroot(mnt_point) < 0) {
+        perror("chroot failed");
+        exit(EXIT_FAILURE);
     }
 
-    // Step 4: Create a mount point for the old root
-    char old_root[256];
-    snprintf(old_root, sizeof(old_root), "%s/old_root", session_root);
-
-    if (mkdir(old_root, 0755) < 0 && errno != EEXIST) {
-        perror("mkdir old_root failed");
-        exit(1);
-    }
-
-    // Step 5: Change to the new root directory
-    if (chdir(session_root) < 0) {
-        perror("chdir session_root failed");
-        exit(1);
-    }
-
-    // Step 6: Perform pivot_root
-    fprintf(stderr, "Mounting %s to %s\n", session_root, old_root);
-    if (pivot_root(session_root, old_root) < 0) {
-        perror("pivot_root failed");
-        exit(1);
-    }
-
-    // Step 7: Switch to the new root
-    if (chdir("/") < 0) {
-        perror("chdir to new / failed");
-        exit(1);
-    }
-
-    // Step 8: Unmount the old root
-    if (umount2("/old_root", MNT_DETACH) < 0) {
-        perror("umount old_root failed");
-        exit(1);
-    }
-
-    // Step 9: Remove the old root directory
-    if (rmdir("/old_root") < 0) {
-        perror("rmdir old_root failed");
-        exit(1);
-    }
-
-    // Step 10: Recreate necessary directories in the new namespace
-    if (mkdir("/tmp", 0755) < 0 && errno != EEXIST) {
-        perror("mkdir /tmp failed");
-        exit(1);
-    }
-
-    if (mkdir("/home", 0755) < 0 && errno != EEXIST) {
-        perror("mkdir /home failed");
-        exit(1);
-    }
-
-    // 创建新的 /dev 目录
-    if (mkdir("/dev", 0755) < 0 && errno != EEXIST) {
-        perror("mkdir /dev failed");
-        exit(1);
-    }
-
-    // 绑定 /dev 设备目录（共享宿主机的 /dev）
-    if (mount("none", "/dev", "tmpfs", MS_NOSUID | MS_NOEXEC | MS_RELATIME, NULL) < 0) {
-        perror("mount /dev failed");
-        exit(1);
-    }
-
-    // 创建 /dev/pts 目录
-    if (mkdir("/dev/pts", 0755) < 0 && errno != EEXIST) {
-        perror("mkdir /dev/pts failed");
-        exit(1);
-    }
-
-    // 重新挂载 /dev/pts 以支持 PTY
-    if (mount("devpts", "/dev/pts", "devpts", 0, NULL) < 0) {
+    /* Create /dev/pts 
+     * /dev/pts acts as the mount point for the devpts filesystem, which is used to manage PTY devices.
+     * MS_NOSUID: Prevents execution of set-user-ID or set-group-ID binaries within this filesystem.
+     * MS_NOEXEC: Prevents execution of binaries within this filesystem.
+     * gid=5: Sets the group ID for devices created in /dev/pts. Typically, gid=5 corresponds to the tty group.
+     * mode=620: Sets default permissions (0620) for PTY devices created in /dev/pts. This means:
+        Owner (user): Read and write permissions.
+        Group (tty): Write permissions.
+        Others: No permissions.*/
+    mkdir("/dev/pts", 0755);
+    if (mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,gid=5,mode=620") < 0) {
         perror("mount /dev/pts failed");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
-    // 创建 /dev/ptmx 设备文件（用于 PTY）
-    if (mknod("/dev/ptmx", S_IFCHR | 0666, makedev(5, 2)) < 0 && errno != EEXIST) {
-        perror("mknod /dev/ptmx failed");
-        exit(1);
+    /* The /proc filesystem is a virtual filesystem that provides runtime information 
+     * about the system and processes (e.g., process IDs, memory usage, mounted filesystems).
+     * MS_NOEXEC | MS_NOSUID | MS_NODEV: These flags enhance security:
+     * MS_NOEXEC: Prevents execution of any binaries within /proc.
+     * MS_NOSUID: Ignores the set-user-ID and set-group-ID bits, preventing privilege escalation.
+     * MS_NODEV: Disallows the use of device files within /proc. */
+    mkdir("/proc", 0755);
+    if (mount("proc", "/proc", "proc", MS_NOEXEC | MS_NOSUID | MS_NODEV, NULL) < 0) {
+        perror("Mounting /proc failed");
+        exit(EXIT_FAILURE);
     }
 
-    // 创建必要的设备节点
-    system("ln -s /dev/pts/ptmx /dev/ptmx"); // 确保 /dev/ptmx 正确链接
-    system("chmod 666 /dev/ptmx"); // 给予足够权限
-
-    if (mkdir("/proc", 0755) < 0 && errno != EEXIST) {
-        perror("mkdir /proc failed");
-        exit(1);
-    }
-    if (mount("proc", "/proc", "proc", 0, "") < 0) {
-        perror("mount /proc failed");
-        exit(1);
-    }
-
-
-    printf("Namespace setup complete! Isolated environment created.\n");
-}
-
-void setup_namespace2() {
-    if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET) < 0) {
-        perror("unshare failed");
-        exit(1);
-    }
-
-    /* 使 mount namespace 私有，防止影响宿主机 */
-    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
-        perror("mount private failed");
-        exit(1);
-    }
-
-    /* fork 并让子进程成为新的 PID 1 */
-    // pid_t pid = fork();
-    // if (pid < 0) {
-    //     perror("fork failed");
-    //     exit(1);
-    // }
-
-    // if (pid > 0) {
-    //     /* 父进程退出，让子进程成为 PID 1 */
-    //     exit(0);
-    // }
-
-    /* 重新挂载一个新的 `/proc`，防止看到宿主机进程 */
-    if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
-        perror("mount /proc failed");
-        exit(1);
-    }
-
-    // /* 重新挂载一个 tmpfs，隔离 `/tmp` 目录 */
-    if (mount("tmpfs", "/tmp", "tmpfs", 0, NULL) < 0) {
-        perror("mount /tmp failed");
-        exit(1);
-    }
-
-    /* 创建 session_root 目录 */
-    // mkdir(SESSION_ROOT, 0755);
-
-    // /* 让 session_root 变成一个独立的 mount */
-    // if (mount("none", SESSION_ROOT, "tmpfs", 0, "") < 0) {
-    //     perror("mount session_root failed");
-    //     exit(1);
-    // }
-
-    // /* 挂载必需的设备文件到 session_root */
-    // if (mount("none", SESSION_ROOT"/dev", "tmpfs", MS_NODEV | MS_NOEXEC | MS_NOSUID, "") < 0) {
-    //     perror("mount /dev failed");
-    //     exit(1);
-    // }
-
-    // if (mkdir(SESSION_ROOT"/dev/pts", 0755) < 0 && errno != EEXIST) {
-    //     perror("mkdir /dev/pts failed");
-    //     exit(1);
-    // }
-
-    // if (mount("devpts", SESSION_ROOT"/dev/pts", "devpts", 0, NULL) < 0) {
-    //     perror("mount /dev/pts failed");
-    //     exit(1);
-    // }
-
-    // if (mkdir(SESSION_ROOT"/dev/tty", 0755) < 0 && errno != EEXIST) {
-    //     perror("mkdir /dev/tty failed");
-    //     exit(1);
-    // }
-
-    // /* chroot 到 SESSION_ROOT，使其成为新的根目录 */
-    // if (chroot(SESSION_ROOT) < 0) {
-    //     perror("chroot failed");
-    //     exit(1);
-    // }
-
-    if (chroot("/tmp") < 0) {
-        perror("chroot failed");
-        exit(1);
-    }
-
-    /* 切换到新根目录，防止访问宿主机 */
-    if (chdir("/") < 0) {
-        perror("chdir to new root failed");
-        exit(1);
+    /* ensures the correct handling of the /dev/ptmx file, 
+     * which is the pseudoterminal master multiplexer.
+     * 
+     * If there is an old or incorrect file, it needs to 
+     * be removed before creating a new symbolic link. 
+     * This ensures consistency and avoids conflicts.
+     * 
+     * Creates a symbolic link at /dev/ptmx that points to /dev/pts/ptmx.
+     * Purpose: Redirects access to /dev/ptmx (the legacy location 
+     * for the pseudoterminal master multiplexer) 
+     * to its modern equivalent at /dev/pts/ptmx*/
+    unlink("/dev/ptmx");
+    if (symlink("/dev/pts/ptmx", "/dev/ptmx") < 0) {
+        perror("symlink /dev/ptmx -> /dev/pts/ptmx failed");
     }
 
     printf("Namespace setup complete! Isolated environment created.\n");
 }
-
-static void setup_namespace3() {
-    if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET) < 0) {
-        perror("unshare failed");
-        exit(1);
-    }
-
-    /* 使 mount namespace 私有，防止影响宿主机 */
-    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
-        perror("mount private failed");
-        exit(1);
-    }
-
-    /* 创建 session_root 目录 */
-    char session_root[256];
-    snprintf(session_root, sizeof(session_root), "/tmp/session_%d", getpid());
-
-    if (mkdir(session_root, 0755) < 0 && errno != EEXIST) {
-        perror("mkdir session_root failed");
-        exit(1);
-    }
-
-    /* 挂载 tmpfs 作为写入层 */
-    if (mount("tmpfs", session_root, "tmpfs", 0, "") < 0) {
-        perror("mount session_root failed");
-        exit(1);
-    }
-
-    /* 挂载 overlay 文件系统 */
-    const char *lower_dir = "/var/lib/sshchroot";  // 只读基础层
-    char upper_dir[256];  // Ensure the buffer size is large enough
-    snprintf(upper_dir, sizeof(upper_dir), "%s/upper", session_root);
-    char work_dir[256];
-    snprintf(work_dir, sizeof(work_dir), "%s/work", session_root);
-    char merged_dir[256];
-    snprintf(merged_dir, sizeof(merged_dir), "%s/merged", session_root);
-
-    if (mkdir(upper_dir, 0755) < 0 && errno != EEXIST) {
-        perror("mkdir upper_dir failed");
-        exit(1);
-    }
-
-    if (mkdir(work_dir, 0755) < 0 && errno != EEXIST) {
-        perror("mkdir work_dir failed");
-        exit(1);
-    }
-
-    if (mkdir(merged_dir, 0755) < 0 && errno != EEXIST) {
-        perror("mkdir merged_dir failed");
-        exit(1);
-    }
-
-    char overlay_opts[256];
-    snprintf(overlay_opts, sizeof(overlay_opts), "lowerdir=%s,upperdir=%s,workdir=%s", lower_dir, upper_dir, work_dir);
-
-    if (mount("overlay", merged_dir, "overlay", 0, overlay_opts) < 0) {
-        perror("mount overlay failed");
-        exit(1);
-    }
-
-    /* chroot 到合并后的目录 */
-    if (chroot(merged_dir) < 0) {
-        perror("chroot failed");
-        exit(1);
-    }
-
-    /* 切换到新根目录 */
-    if (chdir("/") < 0) {
-        perror("chdir to new root failed");
-        exit(1);
-    }
-
-    printf("Namespace setup complete! Isolated environment created.\n");
-}
-
 
 /****************************************************************************/
 static int
@@ -1124,8 +1004,6 @@ int main(int argc, char **argv) {
             /* Remove socket binding, which allows us to restart the
              * parent process, without terminating existing sessions. */
             ssh_bind_free(sshbind);
-
-            setup_namespace3();
 
             event = ssh_event_new();
             if (event != NULL) {
