@@ -959,22 +959,17 @@ int main(int argc, char **argv) {
     sshbind = ssh_bind_new();
     if (sshbind == NULL) {
         fprintf(stderr, "ssh_bind_new failed\n");
-        ssh_finalize();
-        return 1;
+        goto cleanup;
     }
 
     if (parse_opt(argc, argv, sshbind) < 0) {
-        ssh_bind_free(sshbind);
-        ssh_finalize();
-        return 1;
+        goto cleanup;
     }
 
     rc = ssh_bind_listen(sshbind);
     if (rc < 0) {
         fprintf(stderr, "%s\n", ssh_get_error(sshbind));
-        ssh_bind_free(sshbind);
-        ssh_finalize();
-        return 1;
+        goto cleanup;
     }
 
     while (1) {
@@ -1027,7 +1022,8 @@ int main(int argc, char **argv) {
         ssh_free(session);
     }
 
-    ssh_bind_free(sshbind);
+cleanup:
+    if (sshbind) ssh_bind_free(sshbind);
     ssh_finalize();
     return 0;
 }
